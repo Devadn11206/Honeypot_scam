@@ -1,0 +1,11 @@
+INFO:     Started server process [15064]
+INFO:     Waiting for application startup.
+2026-02-08 19:28:18,188 WARNING root: Redis unavailable at startup; falling back to in-memory store.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-02-08 19:28:26,822 INFO root: History passed to LLM: ['scammer: IFSC HDFC0O01234 should NOT match; IFSC HDFC0001234 should match']
+2026-02-08 19:28:28,107 INFO httpx: HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-08 19:28:36,894 INFO root: Callback Status: 200
+2026-02-08 19:32:05,736 INFO root: History passed to LLM: ['scammer: Transfer verification fee to account 1234567890 IFSC SBIN0001234 immediately.']
+2026-02-08 19:32:06,176 INFO httpx: HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-08 19:32:15,315 INFO root: Callback Status: 200
