@@ -1,36 +1,3 @@
-# Python bytecode
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
-venv/
+data/*.csv
 .venv/
-ENV/
-env/
-env.bak/
-
-# Environment files
-.env
-.env.*
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
-
-# Tool caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# IDEs
-.vscode/
-.idea/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
+__pycache__/
