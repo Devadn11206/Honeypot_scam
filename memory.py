@@ -54,3 +54,18 @@ def update_persona_facts(conversation_id: str, facts: list) -> list:
 def get_persona_facts(conversation_id: str) -> list:
     with _lock:
         return list(conversations[conversation_id].get("persona_facts", []))
+
+
+def get_conversation_snapshot(conversation_id: str) -> dict | None:
+    """Return a snapshot of a conversation without creating a new entry."""
+    with _lock:
+        if conversation_id not in conversations:
+            return None
+        convo = conversations[conversation_id]
+        return {
+            "history": list(convo.get("history") or []),
+            "start_time": float(convo.get("start_time") or 0.0),
+            "persona_facts": list(convo.get("persona_facts") or []),
+            # Include any extra flags if present (e.g., callback_sent)
+            **{k: v for k, v in convo.items() if k not in {"history", "start_time", "persona_facts"}},
+        }

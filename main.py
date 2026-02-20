@@ -3,6 +3,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import asyncio
 import logging
+import os
 import re
 import time
 import functools
@@ -10,15 +11,18 @@ from typing import Any
 
 import anyio
 
-from schemas import MessageContent, HoneypotResponse
+from schemas import MessageContent, HoneypotReplyResponse
+from debug_session import get_session_data, generate_final_output_json
 from config import API_KEY
 from redis_store import append_message, get_history, set_history, mark_callback_sent, redis_available
-from agent import generate_agent_response, extract_intelligence_from_history, extract_persona_facts_from_history
+from agent import extract_persona_facts_from_history
 from memory import update_persona_facts, get_persona_facts
 from callback import send_final_callback
 from logger import log_message_event
-from hybrid_decision import compute_final_risk
+from honeypot_core import update_session_state, generate_reply
 from sophistication import compute_sophistication
+from campaign_store import detect_campaign
+from priority import compute_priority, generate_investigator_summary, extract_suspicious_keywords
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +32,7 @@ logging.basicConfig(
 app = FastAPI(title="Agentic Honeypot API")
 SAFE_FALLBACK_REPLY = "I'm not sure about this. Could you please share the official helpline or website so I can verify?"
 LATENCY_SAFE_FALLBACK_REPLY = "I’m not sure I understand. Could you share more details?"
+AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "4.5"))
 
 
 def _empty_intel() -> dict:
@@ -176,19 +181,19 @@ def _safe_int(value: Any, default: int) -> int:
         return default
 
 def _coerce_message(raw: Any, fallback_text: str) -> MessageContent:
-    now_ms = int(time.time() * 1000)
     if isinstance(raw, dict):
         sender = raw.get("sender") or "user"
         text = raw.get("text") or raw.get("message") or fallback_text or ""
-        timestamp = _safe_int(raw.get("timestamp"), now_ms)
+        # Do NOT default to server time; missing timestamps should remain 0.
+        timestamp = _safe_int(raw.get("timestamp"), 0)
     elif isinstance(raw, str):
         sender = "user"
         text = raw
-        timestamp = now_ms
+        timestamp = 0
     else:
         sender = "user"
         text = fallback_text or ""
-        timestamp = now_ms
+        timestamp = 0
 
     return MessageContent(sender=sender, text=text, timestamp=timestamp)
 
@@ -222,19 +227,24 @@ async def _handle_message_universal(
         message = _coerce_message(message_raw, fallback_text=payload.get("text", ""))
 
         history_raw = payload.get("conversationHistory") or payload.get("conversation_history")
-        history_items = []
+        client_history_items: list[MessageContent] = []
         if isinstance(history_raw, list):
             for item in history_raw:
-                history_items.append(_coerce_message(item, fallback_text=""))
+                client_history_items.append(_coerce_message(item, fallback_text=""))
 
-        # 1. Resolve history (client-provided overrides server state)
-        if history_items:
-            set_history(session_id, history_items)
-        else:
-            history_items = get_history(session_id)
+        # Merge client conversationHistory with server history (do NOT wipe honeypot replies).
+        server_history_items = get_history(session_id)
+        session_state = update_session_state(
+            session_id=session_id,
+            incoming_message=message,
+            conversation_history=client_history_items,
+            server_history=server_history_items,
+        )
 
-        append_message(session_id, message)
-        history_items.append(message)
+        history_items: list[MessageContent] = list(session_state.get("history") or [])
+        # Persist the merged history as the canonical source.
+        set_history(session_id, history_items)
+
         history = [
             f"{m.sender}: {m.text}" if m.sender else m.text
             for m in history_items
@@ -245,19 +255,22 @@ async def _handle_message_universal(
         update_persona_facts(session_id, persona_facts)
         persona_facts = get_persona_facts(session_id)
         
-        # 2. Get AI analysis (non-blocking)
+        # 2. Generate conversational reply (non-blocking)
         logging.info("History passed to LLM: %s", history)
         try:
-            agent_data = await anyio.to_thread.run_sync(
-                functools.partial(generate_agent_response, history, persona_facts=persona_facts)
-            )
+            with anyio.fail_after(AGENT_TIMEOUT_SECONDS):
+                reply_text, agent_notes = await anyio.to_thread.run_sync(
+                    functools.partial(generate_reply, session_state=session_state, persona_facts=persona_facts),
+                    cancellable=True,
+                )
+        except TimeoutError:
+            logging.warning("Reply generation timed out after %.2fs; using safe fallback reply.", AGENT_TIMEOUT_SECONDS)
+            reply_text = SAFE_FALLBACK_REPLY
+            agent_notes = "Fallback reply due to timeout; continue verification-style questioning."
         except Exception:
-            logging.exception("Agent response failed; using safe fallback reply.")
-            agent_data = {
-                "agent_reply": SAFE_FALLBACK_REPLY,
-                "extracted_intelligence": extract_intelligence_from_history(history),
-                "risk_analysis": {"exposure_risk": "low", "reasoning": "Fallback due to agent error"},
-            }
+            logging.exception("Reply generation failed; using safe fallback reply.")
+            reply_text = SAFE_FALLBACK_REPLY
+            agent_notes = "Fallback reply due to error; continue verification-style questioning."
     except HTTPException:
         raise
     except Exception:
@@ -265,17 +278,19 @@ async def _handle_message_universal(
         return {
             "status": "success",
             "reply": LATENCY_SAFE_FALLBACK_REPLY,
-            "scam_detected": False,
-            "confidence_score": 0.0,
-            "extracted_intelligence": _empty_intel(),
-            "sophistication_level": "low",
-            "intelligence_value_score": 0,
         }
     
-    # 3. Mandatory Callback Trigger
-    # Rule: Send if scam is confirmed AND we have at least 5 messages
-    extracted = _normalize_intel(agent_data.get("extracted_intelligence"))
-    suspicious_phrases = (agent_data.get("risk_analysis") or {}).get("suspicious_phrases") or []
+    # 3. Internal scoring + callback trigger
+    extracted_cc = session_state.get("extractedIntelligence") or {}
+    extracted = {
+        "phone_numbers": list(extracted_cc.get("phoneNumbers") or []),
+        "bank_accounts": list(extracted_cc.get("bankAccounts") or []),
+        "upi_ids": list(extracted_cc.get("upiIds") or []),
+        "phishing_urls": list(extracted_cc.get("phishingLinks") or []),
+        "ifsc_codes": [],
+    }
+    extracted = _normalize_intel(extracted)
+    suspicious_phrases: list[str] = []
     has_intel = any(extracted.get(key) for key in [
         "bank_accounts",
         "upi_ids",
@@ -286,17 +301,19 @@ async def _handle_message_universal(
 
     history_text = "\n".join(history)
 
-    model_detected = bool(agent_data.get("scam_detected"))
-    try:
-        model_confidence = float(agent_data.get("confidence_score", 0.0))
-    except Exception:
-        model_confidence = 0.0
-
-    scam_detected, confidence_score = compute_final_risk(
-        model_detected=model_detected,
-        confidence_score=model_confidence,
+    campaign_info = detect_campaign(extracted)
+    suspicious_keywords = extract_suspicious_keywords(history_text)
+    priority_level = compute_priority({**extracted, "suspicious_keywords": suspicious_keywords})
+    investigator_summary = generate_investigator_summary(
+        session_id=session_id,
         extracted_intelligence=extracted,
+        priority_level=priority_level,
+        campaign_info=campaign_info,
     )
+
+    scam_signals = session_state.get("scamSignals")
+    scam_detected = bool(getattr(scam_signals, "scamDetected", False))
+    confidence_score = float(getattr(scam_signals, "confidenceLevel", 0.0))
 
     soph = compute_sophistication(history_text, extracted)
     sophistication_level = soph.get("sophistication_level", "low")
@@ -311,14 +328,14 @@ async def _handle_message_universal(
                     session_id=session_id,
                     history=history,
                     intelligence=extracted,
-                    notes=agent_data.get("reasoning"),
-                    risk_analysis=agent_data.get("risk_analysis"),
+                    notes=agent_notes,
+                    risk_analysis={"confidence": confidence_score, "scamDetected": scam_detected},
                 )
             )
         )
 
-    # 4. Return the EXACT keys required by Section 8
-    reply_text = agent_data.get("agent_reply") or SAFE_FALLBACK_REPLY
+    # 4. Return ONLY the conversational reply (do not expose internal analysis)
+    reply_text = reply_text or SAFE_FALLBACK_REPLY
 
     # Hard guard: avoid repeating the exact same honeypot reply
     last_honeypot = ""
@@ -328,11 +345,10 @@ async def _handle_message_universal(
             break
     if last_honeypot and reply_text.strip().lower() == last_honeypot.strip().lower():
         reply_text = reply_text.rstrip(". ") + ". Also, can you share the official helpline or IFSC code?"
-    reply_message = MessageContent(
-        sender="honeypot",
-        text=reply_text,
-        timestamp=int(time.time() * 1000),
-    )
+    # IMPORTANT: avoid mixing server-side timestamps with client epoch-ms timestamps.
+    # Use the incoming message timestamp for the honeypot reply so duration stays consistent.
+    reply_ts = int(message.timestamp or 0)
+    reply_message = MessageContent(sender="honeypot", text=reply_text, timestamp=reply_ts)
     append_message(session_id, reply_message)
 
     # Log incoming and outgoing messages to CSV
@@ -344,8 +360,8 @@ async def _handle_message_universal(
                 sender=message.sender,
                 message=message.text,
                 intel=extracted,
-                confidence=agent_data.get("confidence_score"),
-                scam_detected=agent_data.get("scam_detected"),
+                confidence=confidence_score,
+                scam_detected=scam_detected,
                 suspicious_phrases=suspicious_phrases,
             )
         )
@@ -358,27 +374,19 @@ async def _handle_message_universal(
                 sender="honeypot",
                 message=reply_text,
                 intel=extracted,
-                confidence=agent_data.get("confidence_score"),
-                scam_detected=agent_data.get("scam_detected"),
+                confidence=confidence_score,
+                scam_detected=scam_detected,
                 suspicious_phrases=suspicious_phrases,
             )
         )
     )
 
-    # Simulated typing delay to reduce bot-like responses and smooth rate limits
-    await asyncio.sleep(0.4)
-
     return {
         "status": "success",
         "reply": reply_text,
-        "scam_detected": bool(scam_detected),
-        "confidence_score": float(confidence_score),
-        "extracted_intelligence": extracted,
-        "sophistication_level": sophistication_level,
-        "intelligence_value_score": intelligence_value_score,
     }
 
-@app.post("/honeypot/message", response_model=HoneypotResponse)
+@app.post("/honeypot/message", response_model=HoneypotReplyResponse)
 async def handle_message(
     request: Request,
     x_api_key: str | None = Header(None, alias="x-api-key"),
@@ -386,9 +394,26 @@ async def handle_message(
     return await _handle_message_universal(request, x_api_key)
 
 # Robust fallback: accept POSTs to "/" and route to honeypot logic
-@app.post("/", response_model=HoneypotResponse)
+@app.post("/", response_model=HoneypotReplyResponse)
 async def handle_root_post(
     request: Request,
     x_api_key: str | None = Header(None, alias="x-api-key"),
 ):
     return await _handle_message_universal(request, x_api_key)
+
+
+@app.get("/debug-session/{session_id}")
+async def debug_session(
+    session_id: str,
+    x_api_key: str | None = Header(None, alias="x-api-key"),
+):
+    """Debug-only endpoint to inspect internally-generated final output for a session."""
+
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    session_data = get_session_data(session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return generate_final_output_json(session_id, session_data)

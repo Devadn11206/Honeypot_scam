@@ -60,3 +60,13 @@ class HoneypotResponse(BaseModel):
     extracted_intelligence: Dict[str, Any] = Field(default_factory=dict)
     sophistication_level: str = "low"
     intelligence_value_score: int = 0
+    campaign_detected: bool = False
+    campaign_strength: int = 1
+    priority_level: str = "low"
+    investigator_summary: Dict[str, Any] = Field(default_factory=dict)
+
+
+# Reply-only response (do not expose internal scam analysis fields)
+class HoneypotReplyResponse(BaseModel):
+    status: str = "success"
+    reply: str
