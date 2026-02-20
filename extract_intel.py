@@ -1,4 +1,6 @@
 import re
+import html
+import urllib.parse
 from typing import Iterable, Sequence
 
 _NON_DIGIT = re.compile(r"\D+")
@@ -9,6 +11,7 @@ _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 # Spec: URLs
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_DOMAIN_RE = re.compile(r"\b(?:[a-z0-9\-]+\.)+[a-z]{2,}(?:/[^\s]*)?", re.IGNORECASE)
 
 # Spec: Phone numbers
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-]{8,15}")
@@ -29,13 +32,25 @@ def _normalize_obfuscation(text: str) -> str:
     t = re.sub(r"\[\s*\.\s*\]", ".", t)
     t = re.sub(r"\(\s*\.\s*\)", ".", t)
     t = re.sub(r"(?<=\w)\s+dot\s+(?=\w)", ".", t)
+    # handle d-o-t, d.o.t, d o t, and bracketed dot-like variations (with optional surrounding dashes)
+    t = re.sub(r"-?[dD][\s.\-_]*[oO0][\s.\-_]*[tT]-?", ".", t)
     t = re.sub(r"\b(at)\b", "@", t)
+    t = re.sub(r"\[\s*at\s*\]|\(\s*at\s*\)", "@", t)
+
+    # Handle "colon" and "slash" words with optional surrounding dashes
+    # Match "colon" with internal and external dashes
+    t = re.sub(r"-?c[\s.\-_]*o[\s.\-_]*l[\s.\-_]*o[\s.\-_]*n-?", ":", t)
+    # Match "slash" with internal and external dashes
+    t = re.sub(r"-?s[\s.\-_]*l[\s.\-_]*a[\s.\-_]*s[\s.\-_]*h-?", "/", t)
 
     # Normalize hxxp / hxxps and split-letter http variants.
     t = re.sub(r"\bhxxps\b", "https", t)
     t = re.sub(r"\bhxxp\b", "http", t)
     t = re.sub(r"h\s*[-._]*t\s*[-._]*t\s*[-._]*p\s*[-._]*s", "https", t)
     t = re.sub(r"h\s*[-._]*t\s*[-._]*t\s*[-._]*p", "http", t)
+
+    # Handle spaced letters like "h t t p s" more generally
+    t = re.sub(r"h(\s|[-._])*t(\s|[-._])*t(\s|[-._])*p(\s|[-._])*s?", lambda m: "https" if "s" in m.group(0) else "http", t)
 
     # Normalize "http colon slash slash" and bracketed separators.
     t = re.sub(r"https?\s*(\[\s*:\s*\]|:)\s*(slash\s*slash|/\s*/)", "https://", t)
@@ -49,6 +64,29 @@ def _normalize_obfuscation(text: str) -> str:
     t = re.sub(r"https://\s+", "https://", t)
     t = re.sub(r"http://\s+", "http://", t)
     t = re.sub(r"\s+", " ", t).strip()
+    # Unescape HTML entities (e.g. &#46; -> .) and percent-encoded sequences
+    try:
+        t = html.unescape(t)
+    except Exception:
+        pass
+    try:
+        # unquote will convert %3A%2F%2F -> :// so subsequent regexes can normalize
+        t = urllib.parse.unquote(t)
+    except Exception:
+        pass
+
+    # Final clean pass: collapse repeated separators and stray spaces
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Collapse spaced single-letter obfuscations like "e x a m p l e . c o m"
+    def _collapse_spaced_letters(m: re.Match) -> str:
+        return re.sub(r"\s+", "", m.group(0))
+
+    try:
+        t = re.sub(r"\b(?:[a-zA-Z]\s+){2,}[a-zA-Z]\b", _collapse_spaced_letters, t)
+    except Exception:
+        pass
+
     return t
 
 def _normalize_bank_account(raw: str) -> str | None:
@@ -188,12 +226,28 @@ def extract_intel(text_or_texts: str | Sequence[str]):
         if normalized:
             phone_numbers.add(normalized)
 
+    # Build phishing URL set: include explicit http(s) URLs and domain-only links
+    urls_set: set[str] = set()
+    for u in _URL_RE.findall(normalized_text):
+        urls_set.add(u)
+    for d in _DOMAIN_RE.findall(normalized_text):
+        if "@" in d:
+            # likely part of an email, skip
+            continue
+        # skip if already present (substring match)
+        if any(d in u for u in urls_set):
+            continue
+        if not re.match(r"https?://", d, re.IGNORECASE):
+            urls_set.add("http://" + d)
+        else:
+            urls_set.add(d)
+
     return {
         "upi_ids": sorted(upis),
         "bank_accounts": sorted(bank_accounts),
         "ifsc_codes": sorted(ifsc_codes),
         "phone_numbers": sorted(phone_numbers),
-        "phishing_urls": sorted(set(_URL_RE.findall(normalized_text))),
+        "phishing_urls": sorted(urls_set),
     }
 
 

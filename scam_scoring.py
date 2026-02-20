@@ -29,13 +29,31 @@ def compute_scam_score(text: str, extracted_intelligence: dict) -> Tuple[bool, f
     if upi_ids or bank_accounts or ifsc_codes:
         score += 0.5
 
-    payment_phrases = ("send", "transfer", "pay")
+    payment_phrases = ("send", "transfer", "pay", "remit", "invoice", "wire", "fund", "bank transfer", "new account", "swift", "beneficiary")
     if phone_numbers and any(p in lowered for p in payment_phrases):
         score += 0.2
 
-    urgency_phrases = ("urgent", "immediately", "blocked account", "otp")
+    # If an explicit payment-related phrase appears together with an account identifier, boost score (BEC-like)
+    if (bank_accounts or upi_ids) and any(p in lowered for p in payment_phrases):
+        score += 0.5
+
+    # If audit/migration/account-change context appears with a payment identifier, treat as high-risk BEC
+    audit_phrases = ("audit", "migrat", "migration", "change of bank", "new bank", "account migration", "details have changed", "internal audit", "banking details", "new account", "update bank", "beneficiary change")
+    if (bank_accounts or upi_ids or ifsc_codes) and any(p in lowered for p in audit_phrases):
+        score += 0.6
+
+    # If job-related context appears with a payment identifier (UPI/bank), treat as job fraud
+    job_phrases = ("hiring", "job", "recruit", "recruiting", "recruitment", "vacancy", "onboarding", "interview", "employment", "employ", "position", "applicant", "freelance", "gig", "contract", "virtual assistant", "data entry", "remote work", "work from home")
+    if (upi_ids or bank_accounts or ifsc_codes) and any(p in lowered for p in job_phrases):
+        score += 0.5
+
+    urgency_phrases = ("urgent", "immediately", "blocked account", "otp", "asap", "final warning", "act now", "expires soon")
     if any(p in lowered for p in urgency_phrases):
         score += 0.1
+
+    # Phishing + payment identifier combo (broader detection)
+    if phishing_urls and (upi_ids or bank_accounts):
+        score += 0.3
 
     if phishing_urls:
         score += 0.2

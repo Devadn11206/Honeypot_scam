@@ -156,7 +156,7 @@ def detect_behavioral_signals(text: str, *, extracted: dict[str, Any] | None = N
 
     financial_action = bool(
         re.search(
-            r"\b(transfer|send\s+money|pay|payment|verification\s+fee|confirm\s+account|beneficiary|validate\s+payment|deposit|transaction|verify\s+payment\s+destination)\b",
+            r"\b(?:transfer|transfer\s+(?:funds|money)|send\s+money|remit|pay(?:\s+now)?|payment|invoice|invoices|verification\s+fee|confirm\s+account|beneficiary|validate\s+payment|deposit|transaction|settle(?:ment)?|bank(?:ing)?\s*details|verify\s+payment\s+destination|wire(?:\s+transfer)?|fund|bank\s+transfer|new\s+(?:account|bank)|swift|account\s+creation)\b",
             normalized,
         )
     )
@@ -202,11 +202,17 @@ def detect_behavioral_signals(text: str, *, extracted: dict[str, Any] | None = N
         "identity_harvesting": bool(re.search(r"\b(confirm|verify|update|share|submit)\b.{0,40}\b(email|phone|mobile|password|username|aadhaar|pan|dob|birth\s*date|address)\b", normalized)),
         "unrealistic_reward": bool(re.search(r"\b(lottery|jackpot|guaranteed\s*returns?|double\s*your\s*money|crypto\s*doubling|assured\s*profit|risk\s*free\s*profit|winner|won\s*prize|free\s*money)\b", normalized)),
         "impersonation": bool(authority_claim and org_reference),
+        "account_change_scam": bool(
+            re.search(
+                r"\b(details\s+(?:have\s+)?changed|change\s+of\s+bank\s+details|new\s+bank\s+details|new\s+account|update\s+payment\s+info|update\s+bank|remit(?:\s+to)?|pending\s+invoices?|invoice|invoices|internal\s+audit|account[-\s]*migration|migrat(?:ion|ed)|wireframe|beneficiary\s+change|banking\s+(?:update|change))\b",
+                normalized,
+            )
+        ),
         "threat": bool(re.search(r"\b(legal\s*action|arrest|penalty|fine|court|fir|warrant|account\s*will\s*be\s*blocked|service\s*will\s*be\s*terminated)\b", normalized)),
         "suspicious_link": bool(obfuscated_url or has_short or has_unknown),
         "emotional_manipulation": bool(re.search(r"\b(accident|hospital|family\s*emergency|mother\s*is\s*sick|father\s*is\s*sick|help\s*me\s*urgently|medical\s*emergency)\b", normalized)),
         "secrecy_instruction": bool(re.search(r"\b(don['’]?t\s*tell\s*anyone|keep\s*this\s*secret|confidential|private\s*only|do\s*not\s*inform|bypass\s*official\s*channel|avoid\s*bank\s*support)\b", normalized)),
-        "job_related": bool(re.search(r"\b(job|hiring|recruitment|interview|vacancy|work\s*from\s*home|part\s*time\s*job)\b", normalized)),
+        "job_related": bool(re.search(r"\b(job|hiring|recruit(?:ing|ment)?|interview|vacancy|employ(?:ment|ee)?|onboarding|work\s+from\s+home|part\s*time\s*job|position|applicant|freelance|gig|contract(?:or)?|virtual\s+(?:assistant|job)|data\s+entry|remote\s+work|work\s+at\s+home)\b", normalized)),
         "financial_action": bool(financial_action),
         "payment_identifier_present": bool(payment_identifier_present),
     }
@@ -258,12 +264,49 @@ def compute_scam_score(behavior: dict[str, Any]) -> dict[str, Any]:
     if signals.get("financial_action") and signals.get("payment_identifier_present"):
         score += 0.4
         combo_triggers.append("combo_financial_action_payment_identifier")
+    # High-risk: account migration / change combined with a payment identifier (BEC style)
+    if signals.get("account_change_scam") and signals.get("payment_identifier_present"):
+        score += 0.6
+        combo_triggers.append("combo_account_migration_fraud")
     if signals.get("job_related") and signals.get("fee_for_opportunity"):
         score += 0.4
         combo_triggers.append("combo_job_fee")
+    # Job fraud: job-related + payment identifier (UPI/bank) = high-risk employment scam
+    if signals.get("job_related") and signals.get("payment_identifier_present"):
+        score += 0.5
+        combo_triggers.append("combo_job_fraud_payment")
     if signals.get("unrealistic_reward") and (signals.get("direct_payment_request") or signals.get("financial_action")):
         score += 0.3
         combo_triggers.append("combo_reward_payment")
+    # Broader combo triggers for additional detection patterns
+    # Obfuscated link + payment identifier + urgency = phishing scam
+    if signals.get("suspicious_link") and signals.get("payment_identifier_present") and signals.get("urgency"):
+        score += 0.5
+        combo_triggers.append("combo_phishing_payment_urgency")
+    # Obfuscated link + financial action = phishing with payment request
+    if signals.get("suspicious_link") and signals.get("financial_action"):
+        score += 0.4
+        combo_triggers.append("combo_phishing_payment")
+    # Urgency + fee request = urgent scam fee
+    if signals.get("urgency") and signals.get("fee_for_opportunity"):
+        score += 0.3
+        combo_triggers.append("combo_urgent_fee")
+    # Threat + payment identifier = coercion scam
+    if signals.get("threat") and signals.get("payment_identifier_present"):
+        score += 0.4
+        combo_triggers.append("combo_threat_payment")
+    # Fee + suspicious link = fraudulent offer link
+    if signals.get("fee_for_opportunity") and signals.get("suspicious_link"):
+        score += 0.3
+        combo_triggers.append("combo_fee_phishing")
+    # Suspicious link + authority claim = phishing impersonation scam
+    normalized_text = behavior.get("normalized_text", "")
+    if signals.get("suspicious_link") and re.search(
+        r"\b(i\s*am|this\s+is|calling|message|am\s+from|here\s+writing|am\s+a|works\s+at|employed\s+by)\b.{0,100}\b(from|with|at|representing)\b",
+        normalized_text,
+    ):
+        score += 0.4
+        combo_triggers.append("combo_suspicious_link_authority")
 
     # Anti false positives:
     weak_signals = {"suspicious_link", "urgency", "emotional_manipulation", "secrecy_instruction"}
@@ -280,10 +323,15 @@ def compute_scam_score(behavior: dict[str, Any]) -> dict[str, Any]:
         ]
     )
     coercion = any(signals.get(k) for k in ["urgency", "threat", "secrecy_instruction", "emotional_manipulation"])
+    job_fraud = signals.get("job_related") and signals.get("payment_identifier_present")
+    bec_risk = signals.get("account_change_scam") and signals.get("payment_identifier_present")
+    
+    # Check for high-risk combos that override weak-signal rejection
+    has_critical_combo = any(t.startswith("combo_") for t in combo_triggers if t in ["combo_account_migration_fraud", "combo_job_fraud_payment", "combo_suspicious_link_authority"])
 
-    if len(active_signals) == 1 and active_signals[0] in weak_signals:
+    if len(active_signals) == 1 and active_signals[0] in weak_signals and not has_critical_combo:
         scam_detected = False
-    elif not high_risk and not coercion:
+    elif not high_risk and not coercion and not job_fraud and not bec_risk and not has_critical_combo:
         scam_detected = False
     else:
         scam_detected = score >= 0.4

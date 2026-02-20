@@ -184,8 +184,8 @@ def _coerce_message(raw: Any, fallback_text: str) -> MessageContent:
     if isinstance(raw, dict):
         sender = raw.get("sender") or "user"
         text = raw.get("text") or raw.get("message") or fallback_text or ""
-        # Do NOT default to server time; missing timestamps should remain 0.
-        timestamp = _safe_int(raw.get("timestamp"), 0)
+        # timestamp can be int (epoch ms) or string (ISO 8601); let Pydantic validate
+        timestamp = raw.get("timestamp") or 0
     elif isinstance(raw, str):
         sender = "user"
         text = raw
@@ -232,6 +232,12 @@ async def _handle_message_universal(
             for item in history_raw:
                 client_history_items.append(_coerce_message(item, fallback_text=""))
 
+        # Extract metadata if provided
+        metadata = payload.get("metadata") or {}
+        channel = metadata.get("channel", "Unknown")
+        language = metadata.get("language", "Unknown")
+        locale = metadata.get("locale", "Unknown")
+
         # Merge client conversationHistory with server history (do NOT wipe honeypot replies).
         server_history_items = get_history(session_id)
         session_state = update_session_state(
@@ -257,6 +263,7 @@ async def _handle_message_universal(
         
         # 2. Generate conversational reply (non-blocking)
         logging.info("History passed to LLM: %s", history)
+        logging.info("Request metadata - Channel: %s, Language: %s, Locale: %s", channel, language, locale)
         try:
             with anyio.fail_after(AGENT_TIMEOUT_SECONDS):
                 reply_text, agent_notes = await anyio.to_thread.run_sync(

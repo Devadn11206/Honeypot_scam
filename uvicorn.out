@@ -1,2 +1,0 @@
-INFO:     127.0.0.1:51830 - "POST /honeypot/message HTTP/1.1" 200 OK
-INFO:     127.0.0.1:62761 - "POST /honeypot/message HTTP/1.1" 200 OK
