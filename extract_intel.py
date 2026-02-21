@@ -16,9 +16,11 @@ _DOMAIN_RE = re.compile(r"\b(?:[a-z0-9\-]+\.)+[a-z]{2,}(?:/[^\s]*)?", re.IGNOREC
 # Spec: Phone numbers
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-]{8,15}")
 
-# Spec: Bank accounts (digits only). We also handle spaced/dashed numbers via a looser pattern.
-_BANK_DIGITS_RE = re.compile(r"\b\d{9,18}\b")
-_BANK_LOOSE_RE = re.compile(r"\b(?:\d[\s\-]?){9,23}\b")
+# Spec: Bank accounts (digits only). Allow a wide range of lengths and
+# loose formatting (spaces, dashes, brackets, dots). We'll still prefer
+# phone normalization for obvious phone-like patterns.
+_BANK_DIGITS_RE = re.compile(r"\b\d{6,30}\b")
+_BANK_LOOSE_RE = re.compile(r"\b(?:\d[\s\-\.\(\)\[\]]?){6,40}\b")
 
 # Spec: UPI IDs (name@bank) – email addresses excluded separately.
 _UPI_RE = re.compile(r"\b[a-zA-Z0-9][a-zA-Z0-9._-]{1,64}@[a-zA-Z0-9_-]{2,64}\b")
@@ -104,12 +106,19 @@ def _normalize_obfuscation(text: str) -> str:
 
 def _normalize_bank_account(raw: str) -> str | None:
     digits = _NON_DIGIT.sub("", raw)
-    # Avoid misclassifying phone numbers as bank accounts
+    if not digits:
+        return None
+
+    # Keep phone-safety heuristics to avoid misclassifying common mobile numbers
+    # India 10-digit mobiles starting 6/7/8/9 -> likely phone
     if len(digits) == 10 and digits[0] in {"6", "7", "8", "9"}:
         return None
+    # International pattern: 12-digit starting with country code 91 + 10-digit mobile
     if len(digits) == 12 and digits.startswith("91") and digits[2] in {"6", "7", "8", "9"}:
         return None
-    if 9 <= len(digits) <= 18:
+
+    # Accept a broad range of lengths as potential bank accounts (6..24 digits)
+    if 6 <= len(digits) <= 30:
         return digits
     return None
 
@@ -251,7 +260,23 @@ def extract_intel(text_or_texts: str | Sequence[str]):
 
     phones_raw = _PHONE_RE.findall(normalized_text)
     phone_numbers = set()
+    # Build a set of bank digit strings to avoid double-classifying the same
+    # digit sequence as both a bank account and a phone number.
+    bank_digits_set = set(bank_accounts)
     for raw in phones_raw:
+        # Extract raw digits for overlap checks
+        raw_digits = _NON_DIGIT.sub("", raw)
+        # If raw digits overlap with any detected bank account digits, prefer bank
+        overlap = False
+        for b in bank_digits_set:
+            if not b:
+                continue
+            if b in raw_digits or raw_digits in b:
+                overlap = True
+                break
+        if overlap:
+            continue
+
         normalized = _normalize_phone(raw)
         if normalized:
             phone_numbers.add(normalized)
