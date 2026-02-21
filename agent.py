@@ -381,7 +381,7 @@ def _build_prompt(history: List[str]) -> str:
         full_prompt += "\n\nAsk for payment details politely."
     return full_prompt
 
-def generate_agent_response(history: List[str], persona_facts: List[str] | None = None) -> Dict:
+def generate_agent_response(history: List[str], persona_facts: List[str] | None = None, channel: str | None = None) -> Dict:
     """
     Acts as an autonomous AI Agent to covertly extract intelligence.
     Returns a dict for internal scoring/intel extraction.
@@ -399,19 +399,40 @@ def generate_agent_response(history: List[str], persona_facts: List[str] | None 
     repeated = _detect_repetition(sanitized_history)
     missing = _missing_intel(sanitized_history)
 
+    # Extract currently captured intelligence early so we can adjust prompt priorities.
+    regex_intel = _extract_intelligence(context)
+
+    # If we already captured a UPI ID, force the LLM to prioritize other missing categories
+    # in its next 1-3 sentences and avoid asking for UPI again.
+    extra_priority_note = ""
+    if regex_intel.get("upi_ids"):
+        # remove 'upi_id' from missing if present
+        non_upi_missing = [m for m in missing if m != "upi_id"]
+        if non_upi_missing:
+            extra_priority_note = (
+                "IMPORTANT: We already have a UPI ID; do NOT ask for UPI again. "
+                f"In the next 1-3 sentences prioritize asking about: {', '.join(non_upi_missing)}.\n"
+            )
+        else:
+            # Nothing else missing — still instruct to ask for another identifier
+            extra_priority_note = (
+                "IMPORTANT: We already have a UPI ID; do NOT ask for UPI again. "
+                "In the next 1-3 sentences try to elicit a phone_number or bank_account instead.\n"
+            )
+
     prompt = (
         "Conversation History:\n" + context + "\n\n"
         f"Emotional state: {emotion}\n"
         + ("Note: You recently repeated yourself; acknowledge and rephrase naturally.\n" if repeated else "")
         + (f"Consistency facts to maintain: {', '.join(persona_facts)}\n" if persona_facts else "")
         + (f"Missing intel to prioritize asking about: {', '.join(missing)}\n" if missing else "")
+        + extra_priority_note
         + "Engagement tactic: Ask for verification details; be cooperative but slow; ask follow-ups.\n\n"
         + "Write ONLY your next reply to the scammer.\n"
         + "Constraints: English only; 1-3 sentences; include at least one question; no JSON; no analysis; no role labels; do not mention AI; do not accuse directly.\n"
     )
 
     scam_detected, confidence, red_flags = assess_scam_risk(context)
-    regex_intel = _extract_intelligence(context)
 
     client = _get_client()
     if client is None:
@@ -426,10 +447,11 @@ def generate_agent_response(history: List[str], persona_facts: List[str] | None 
         }
 
     try:
+        system_content = SYSTEM_INSTRUCTION + (f" Channel: {channel}." if channel else "")
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
@@ -457,7 +479,7 @@ def generate_agent_response(history: List[str], persona_facts: List[str] | None 
             "risk_analysis": {"suspicious_phrases": [], "identifier_links": [], "red_flags": red_flags, "exposure_risk": "low", "reasoning": "Groq API error"},
         }
 
-def generate_agent_reply_stream(history: List[str]) -> Iterable[str]:
+def generate_agent_reply_stream(history: List[str], channel: str | None = None) -> Iterable[str]:
     prompt = _build_prompt(history)
 
     client = _get_client()
@@ -467,10 +489,11 @@ def generate_agent_reply_stream(history: List[str]) -> Iterable[str]:
         return
 
     try:
+        system_content = SYSTEM_INSTRUCTION + (f" Channel: {channel}." if channel else "")
         stream = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
@@ -487,13 +510,13 @@ def generate_agent_reply_stream(history: List[str]) -> Iterable[str]:
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTION},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-            )
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.4,
+                )
             text = (response.choices[0].message.content or "").strip()
             if not text:
                 return
