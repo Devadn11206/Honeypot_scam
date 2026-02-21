@@ -337,7 +337,38 @@ def compute_scam_score(behavior: dict[str, Any]) -> dict[str, Any]:
         scam_detected = score >= 0.4
 
     score = float(max(0.0, min(3.0, score)))
-    confidence = float(max(0.0, min(1.0, min(score, 0.95))))
+
+    # Count high-risk signals to gate "critical" confidence values >0.95.
+    high_risk_keys = [
+        "otp_request",
+        "financial_info_request",
+        "direct_payment_request",
+        "fee_for_opportunity",
+        "identity_harvesting",
+        "unrealistic_reward",
+        "impersonation",
+    ]
+    high_risk_count = sum(1 for k in high_risk_keys if signals.get(k))
+
+    # Base continuous confidence from score (normalized 0..1)
+    raw_confidence = score / 3.0
+    confidence = float(max(0.0, min(1.0, raw_confidence)))
+
+    # Boost confidence when multiple high-risk signals are present so the
+    # result approaches critical, while preserving the final gate below.
+    if high_risk_count >= 3:
+        confidence = max(confidence, 0.99)
+    elif high_risk_count == 2:
+        # Two high-risk signals => near-critical confidence
+        confidence = max(confidence, 0.96)
+    elif has_critical_combo:
+        # Known critical combo gives a strong signal
+        confidence = max(confidence, 0.98)
+
+    # Enforce policy: confidence > 0.95 (Critical) only when there are
+    # at least two high-risk signals or a known critical combo trigger.
+    if confidence > 0.95 and not (high_risk_count >= 2 or has_critical_combo):
+        confidence = 0.95
 
     return {
         "scamDetected": bool(scam_detected),
@@ -533,7 +564,21 @@ def _extract_used_investigative_questions(history_items: Sequence[MessageContent
     return used
 
 
-def generate_reply(*, session_state: dict[str, Any], persona_facts: Sequence[str] | None = None) -> tuple[str, str]:
+def _extract_used_delay_tactics(history_items: Sequence[MessageContent]) -> set[str]:
+    """Return which delay tactic strings have already been used by the honeypot in this session."""
+    used: set[str] = set()
+    for m in history_items:
+        if (m.sender or "").strip().lower() != "honeypot":
+            continue
+        text = (m.text or "").lower()
+        for d in _DELAY_TACTICS:
+            # Match by substring to tolerate slight phrasing differences
+            if d.lower() in text:
+                used.add(d)
+    return used
+
+
+def generate_reply(*, session_state: dict[str, Any], persona_facts: Sequence[str] | None = None, channel: str | None = None) -> tuple[str, str]:
     """Generate a 1–3 sentence conversational reply plus internal agentNotes."""
 
     history_items: list[MessageContent] = list(session_state.get("history") or [])
@@ -569,7 +614,14 @@ def generate_reply(*, session_state: dict[str, Any], persona_facts: Sequence[str
     question_1 = rnd.choice(available)
     question_2_pool = [q for q in available if q != question_1] or [q for q in _INVESTIGATIVE_QUESTIONS if q != question_1]
     question_2 = rnd.choice(question_2_pool)
-    delay = rnd.choice(_DELAY_TACTICS)
+
+    # Rotate delay tactics: avoid repeating the same excuse until all have been used.
+    used_delays = _extract_used_delay_tactics(history_items)
+    available_delays = [d for d in _DELAY_TACTICS if d not in used_delays]
+    if not available_delays:
+        # All used; allow reuse but keep deterministic choice.
+        available_delays = list(_DELAY_TACTICS)
+    delay = rnd.choice(available_delays)
 
     # Ensure at least ~50% investigative questions.
     # Use turn parity for determinism (avoids long streaks of non-investigative prompts).
@@ -619,6 +671,7 @@ def generate_reply(*, session_state: dict[str, Any], persona_facts: Sequence[str
 
     user_prompt = (
         "Conversation so far:\n" + context + "\n\n"
+        f"Channel: {channel or 'unknown'}\n"
         f"Keep persona consistent with these facts (if any): {persona or 'none'}\n"
         f"Scammer pressure level: {'high' if (scam_signals and scam_signals.score >= 0.6) else 'medium'}\n"
         f"Missing intel to ask for: {missing_hint}\n\n"
@@ -642,10 +695,11 @@ def generate_reply(*, session_state: dict[str, Any], persona_facts: Sequence[str
 
     try:
         # Groq SDK doesn’t expose a universal timeout arg across versions; rely on outer fail_after.
+        system_content = _SYSTEM_INSTRUCTION + (f" Channel: {channel}." if channel else "")
         response = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": _SYSTEM_INSTRUCTION},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.6,

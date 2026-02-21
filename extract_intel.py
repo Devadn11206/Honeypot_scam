@@ -87,6 +87,19 @@ def _normalize_obfuscation(text: str) -> str:
     except Exception:
         pass
 
+    # Collapse spaced/dashed digit sequences that represent phone numbers or
+    # bank account numbers (e.g., "8 8 0 0 1 2 3 4 5 6" -> "8800123456").
+    def _collapse_spaced_digits(m: re.Match) -> str:
+        s = re.sub(r"[^0-9]", "", m.group(0))
+        return s
+
+    try:
+        # Match sequences of digits separated by spaces, dots or dashes, with
+        # at least 9 digits total (covers phones and many bank accounts).
+        t = re.sub(r"(?:\d[\s\-\.\[\]\(\)]?){9,}", _collapse_spaced_digits, t)
+    except Exception:
+        pass
+
     return t
 
 def _normalize_bank_account(raw: str) -> str | None:
@@ -207,6 +220,23 @@ def extract_intel(text_or_texts: str | Sequence[str]):
     bank_candidates.extend(_BANK_LOOSE_RE.findall(normalized_text))
     bank_accounts = set()
     for candidate in bank_candidates:
+        # Determine if surrounding context suggests this is a phone number
+        phone_context_terms = ("phone", "call", "mobile", "whatsapp", "contact")
+        phone_like = _normalize_phone(candidate)
+        is_phone_context = False
+        try:
+            idx = normalized_text.find(candidate)
+            if idx != -1:
+                window = normalized_text[max(0, idx - 30): idx + len(candidate) + 30].lower()
+                if any(term in window for term in phone_context_terms):
+                    is_phone_context = True
+        except Exception:
+            is_phone_context = False
+
+        # If candidate explicitly includes a plus sign or context implies a phone,
+        # prefer phone normalization and skip bank classification.
+        if ("+" in candidate or phone_like) and ("+" in candidate or phone_like and is_phone_context):
+            continue
         normalized = _normalize_bank_account(candidate)
         if normalized:
             bank_accounts.add(normalized)

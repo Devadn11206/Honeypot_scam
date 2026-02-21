@@ -56,6 +56,23 @@ def generate_investigator_summary(
     priority_level: str,
     campaign_info: dict,
 ) -> dict:
+    # Extract channel metadata if present
+    metadata = extracted_intelligence.get("metadata") if isinstance(extracted_intelligence, dict) else {}
+    channel = (metadata.get("channel") if isinstance(metadata, dict) else None) or extracted_intelligence.get("channel")
+
+    # Map channel to recommended action
+    recommended_action = "Block associated accounts and telecom identifiers"
+    if channel:
+        ch = str(channel).lower()
+        if "sms" in ch:
+            recommended_action = "Report SMS sender to telecom provider; block number; escalate to regulator."
+        elif "whatsapp" in ch or "wa" in ch:
+            recommended_action = "Report profile to WhatsApp and block; collect account flags for platform takedown."
+        elif "email" in ch:
+            recommended_action = "Report sender to email provider and mark for spam/phishing; collect headers."
+        elif "social" in ch or "telegram" in ch:
+            recommended_action = "Report account to platform trust & safety; block and collect profile links."
+
     return {
         "session_id": session_id,
         "scam_type": "financial fraud",
@@ -63,5 +80,6 @@ def generate_investigator_summary(
         "priority_level": priority_level,
         "campaign_detected": bool(campaign_info.get("campaign_detected")),
         "campaign_strength": int(campaign_info.get("campaign_strength", 1) or 1),
-        "recommended_action": "Block associated accounts and telecom identifiers",
+        "channel": channel,
+        "recommended_action": recommended_action,
     }
